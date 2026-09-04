@@ -51,9 +51,14 @@ internal object YTDLUpdater {
             if (ytdlpDir.exists()) FileUtils.deleteDirectory(ytdlpDir)
             ytdlpDir.mkdirs()
             FileUtils.copyFile(file, binary)
+            // Updating yt-dlp replaces its whole portable directory, including
+            // YTDLnis-owned extractor plugins. Restore them before any worker can
+            // start a command against the freshly updated binary.
+            SocialExtractorPluginInstaller.install(appContext)
         } catch (e: Exception) {
             FileUtils.deleteQuietly(ytdlpDir)
             getInstance().initYTDLP(appContext, ytdlpDir)
+            SocialExtractorPluginInstaller.install(appContext)
             throw ExecuteException(e)
         } finally {
             file.delete()
