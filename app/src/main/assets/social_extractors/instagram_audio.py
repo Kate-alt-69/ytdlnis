@@ -4,6 +4,11 @@ Instagram's normal yt-dlp extractor deliberately excludes /reels/audio/<id>
 URLs. This extractor resolves the numeric audio asset through Instagram's
 clips/music surfaces and exposes the original audio stream as an audio-only
 format.
+
+Keep this plugin compatible with the yt-dlp version bundled by YTDLnis. In
+particular, yt-dlp 2025.11.12 exposes InstagramBaseIE._API_BASE_URL and
+_api_headers, but not newer helpers such as _BASE_URL, _is_logged_in, or
+_can_impersonate.
 """
 
 import html
@@ -15,6 +20,7 @@ from yt_dlp.utils import ExtractorError, determine_ext, float_or_none, url_or_no
 from yt_dlp.utils.traversal import traverse_obj
 
 
+_WEB_BASE_URL = 'https://www.instagram.com/'
 _AUDIO_URL_KEYS = (
     'progressive_download_url',
     'fast_start_progressive_download_url',
@@ -38,6 +44,9 @@ class InstagramAudioIE(InstagramBaseIE):
     }, {
         'url': 'https://www.instagram.com/reels/audio/1388369548211802?igsi=test',
         'only_matching': True,
+    }, {
+        'url': 'https://www.instagram.com/reels/audio/1514279692102050?igsi=test',
+        'only_matching': True,
     }]
 
     @staticmethod
@@ -52,15 +61,27 @@ class InstagramAudioIE(InstagramBaseIE):
 
     @classmethod
     def _find_audio_info(cls, payload, audio_id):
+        """Find the audio object without accidentally selecting a recommended sound."""
         exact = []
         fallback = []
         for item in cls._walk_dicts(payload):
             if not any(item.get(key) for key in (*_AUDIO_URL_KEYS, 'dash_manifest')):
                 continue
             fallback.append(item)
-            if any(str(item.get(key)) == str(audio_id) for key in _AUDIO_ID_KEYS if item.get(key) is not None):
+            if any(
+                    str(item.get(key)) == str(audio_id)
+                    for key in _AUDIO_ID_KEYS if item.get(key) is not None):
                 exact.append(item)
         return (exact or fallback or [None])[0]
+
+    def _instagram_cookies(self):
+        # Cookies supplied through YTDLnis/yt-dlp's normal --cookies option are
+        # already loaded into yt-dlp's cookie jar. Do not maintain a second login
+        # store in the plugin.
+        return self._get_cookies(_WEB_BASE_URL)
+
+    def _has_instagram_session(self):
+        return bool(self._instagram_cookies().get('sessionid'))
 
     def _api_headers_for_audio(self, webpage_url):
         headers = {
@@ -68,32 +89,33 @@ class InstagramAudioIE(InstagramBaseIE):
             'Referer': webpage_url,
             'X-Requested-With': 'XMLHttpRequest',
         }
-        csrf_cookie = self._get_cookies(self._BASE_URL).get('csrftoken')
+        csrf_cookie = self._instagram_cookies().get('csrftoken')
         if csrf_cookie:
             headers['X-CSRFToken'] = csrf_cookie.value
         return headers
 
     def _download_audio_metadata(self, webpage_url, audio_id):
         headers = self._api_headers_for_audio(webpage_url)
-        common = {
-            'audio_cluster_id': audio_id,
-            'original_sound_audio_asset_id': audio_id,
-        }
 
-        # This is the same app surface Instagram uses for audio aggregation pages.
+        # This mirrors Instagram's track-info request. It is also the request
+        # shape used by maintained Instagram private-API clients.
         payload = self._download_json(
             f'{self._API_BASE_URL}/clips/music/', audio_id,
             note='Downloading Instagram audio metadata',
             errnote='Instagram audio metadata request failed',
             fatal=False,
             headers=headers,
-            data=urlencode_postdata(common)) or {}
+            data=urlencode_postdata({
+                'audio_cluster_id': audio_id,
+                'original_sound_audio_asset_id': audio_id,
+            })) or {}
         audio_info = self._find_audio_info(payload, audio_id)
         if audio_info:
             return audio_info
 
-        # Some accounts/rollouts expose the asset on the streamed pivot endpoint
-        # rather than the older clips/music response.
+        # Newer Instagram clients can render the Audio page through the streamed
+        # clips-pivot endpoint. Keep it as a second API path because deployments
+        # differ between accounts/regions.
         music_page = {
             'tab_type': 'clips',
             'audio_asset_id': audio_id,
@@ -122,12 +144,14 @@ class InstagramAudioIE(InstagramBaseIE):
         return url_or_none(html.unescape(value))
 
     def _audio_from_webpage(self, webpage_url, audio_id):
+        # Do not pass newer yt-dlp-only `impersonate=` helpers here. YTDLnis
+        # currently bundles yt-dlp 2025.11.12 and its normal downloader headers +
+        # cookie jar are sufficient for the authenticated webpage path.
         webpage = self._download_webpage(
             webpage_url, audio_id,
             note='Checking Instagram audio webpage',
             errnote='Instagram audio webpage request failed',
-            fatal=False,
-            impersonate=self._can_impersonate)
+            fatal=False)
         if not webpage:
             return None
 
@@ -148,6 +172,7 @@ class InstagramAudioIE(InstagramBaseIE):
                 media_url = self._decode_embedded_url(raw_url)
                 if media_url:
                     result[key] = media_url
+
             dash_manifest = self._search_regex(
                 r'"dash_manifest"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
                 window, 'DASH manifest', default=None)
@@ -155,7 +180,10 @@ class InstagramAudioIE(InstagramBaseIE):
                 try:
                     result['dash_manifest'] = json.loads(f'"{dash_manifest}"')
                 except (TypeError, ValueError, json.JSONDecodeError):
-                    result['dash_manifest'] = dash_manifest.replace('\\n', '\n').replace('\\"', '"').replace('\\/', '/')
+                    result['dash_manifest'] = (
+                        dash_manifest.replace('\\n', '\n')
+                        .replace('\\"', '"')
+                        .replace('\\/', '/'))
 
             if any(result.get(key) for key in (*_AUDIO_URL_KEYS, 'dash_manifest')):
                 result['title'] = self._og_search_title(webpage, default=None)
@@ -166,11 +194,10 @@ class InstagramAudioIE(InstagramBaseIE):
         formats = []
         seen = set()
 
-        # Prefer the full progressive asset. Only use the web preview when the full
-        # asset is not exposed by this Instagram rollout.
-        preferred_keys = _AUDIO_URL_KEYS[:-1]
+        # Prefer a full progressive asset. The 30-second web preview is a fallback,
+        # not an equivalent replacement for the underlying track asset.
         progressive_found = False
-        for key in preferred_keys:
+        for key in _AUDIO_URL_KEYS[:-1]:
             media_url = url_or_none(audio_info.get(key))
             if not media_url or media_url in seen:
                 continue
@@ -184,7 +211,7 @@ class InstagramAudioIE(InstagramBaseIE):
                 'format_id': key.removesuffix('_download_url'),
                 'ext': ext,
                 'vcodec': 'none',
-                'http_headers': {'Referer': 'https://www.instagram.com/'},
+                'http_headers': {'Referer': _WEB_BASE_URL},
             })
 
         if not progressive_found:
@@ -197,7 +224,7 @@ class InstagramAudioIE(InstagramBaseIE):
                     'ext': 'm4a',
                     'vcodec': 'none',
                     'preference': -20,
-                    'http_headers': {'Referer': 'https://www.instagram.com/'},
+                    'http_headers': {'Referer': _WEB_BASE_URL},
                 })
 
         dash_manifest = audio_info.get('dash_manifest')
@@ -205,6 +232,9 @@ class InstagramAudioIE(InstagramBaseIE):
             mpd_doc = self._parse_xml(dash_manifest, audio_id, fatal=False)
             if mpd_doc is not None:
                 for fmt in self._parse_mpd_formats(mpd_doc, mpd_id='dash'):
+                    # This extractor is deliberately audio-only. Instagram audio
+                    # manifests should already contain audio Representations, but
+                    # keep yt-dlp's format selection from treating them as video.
                     fmt.setdefault('vcodec', 'none')
                     formats.append(fmt)
 
@@ -212,16 +242,23 @@ class InstagramAudioIE(InstagramBaseIE):
 
     def _real_extract(self, url):
         audio_id = self._match_id(url)
-        clean_url = f'https://www.instagram.com/reels/audio/{audio_id}/'
+        clean_url = f'{_WEB_BASE_URL}reels/audio/{audio_id}/'
 
         audio_info = self._download_audio_metadata(clean_url, audio_id)
         if not audio_info:
             audio_info = self._audio_from_webpage(clean_url, audio_id)
         if not audio_info:
-            hint = ' Enable Instagram cookies in YTDLnis and retry.' if not self._is_logged_in else ''
-            raise ExtractorError(
-                f'Instagram did not expose downloadable media for audio {audio_id}.{hint}',
-                expected=True)
+            if self._has_instagram_session():
+                message = (
+                    f'Instagram did not expose downloadable media for audio {audio_id}. '
+                    'The Instagram cookie session may be expired, the audio may be unavailable, '
+                    'or this account is not allowed to access the asset.')
+            else:
+                message = (
+                    f'Instagram did not expose downloadable media for audio {audio_id}. '
+                    'This audio page may require login; add or enable Instagram cookies in '
+                    'YTDLnis and retry.')
+            raise ExtractorError(message, expected=True)
 
         formats = self._extract_formats(audio_info, audio_id)
         if not formats:
