@@ -10,6 +10,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.preference.PreferenceManager
 import com.deniscerri.ytdl.core.RuntimeManager
+import com.deniscerri.ytdl.core.SocialExtractorPluginInstaller
 import com.deniscerri.ytdl.core.models.ExecuteException
 import com.deniscerri.ytdl.database.DBManager
 import com.deniscerri.ytdl.database.repository.ObserveSourcesRepository
@@ -83,6 +84,7 @@ class App : Application(), DefaultLifecycleObserver {
     @Throws(ExecuteException::class)
     private fun initLibraries() {
         RuntimeManager.getInstance().init(this)
+        SocialExtractorPluginInstaller.install(this)
     }
 
     private fun setDefaultValues(){
