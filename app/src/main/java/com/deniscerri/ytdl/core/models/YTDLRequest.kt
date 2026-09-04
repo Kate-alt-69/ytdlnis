@@ -1,5 +1,7 @@
 package com.deniscerri.ytdl.core.models
 
+import com.deniscerri.ytdl.core.RuntimeManager
+
 class YTDLRequest {
     private val urls: List<String>
     private val options = YTDLOptions()
@@ -51,6 +53,21 @@ class YTDLRequest {
     }
 
     fun buildCommand(): List<String> {
+        // YTDLnis runs yt-dlp as a Python zipapp on Android, so yt-dlp's normal
+        // executable-location plugin discovery does not reliably point at the
+        // portable runtime directory. Explicitly add our plugin package root to
+        // every request once installation has created it. Keep any user-supplied
+        // plugin directories alongside it, and never pass a missing directory to
+        // yt-dlp because explicit invalid plugin paths are fatal.
+        val socialPluginDir = RuntimeManager.ytdlpPath
+            ?.parentFile
+            ?.resolve("yt-dlp-plugins")
+        if (socialPluginDir?.isDirectory == true
+            && getArguments("--plugin-dirs")?.none { it == socialPluginDir.absolutePath } != false
+        ) {
+            options.addOption("--plugin-dirs", socialPluginDir.absolutePath)
+        }
+
         val commandList: MutableList<String> = ArrayList()
         commandList.addAll(options.buildOptions())
         commandList.addAll(customCommandList)
