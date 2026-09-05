@@ -1,0 +1,51 @@
+name: Package Git-ready checkout
+
+on:
+  push:
+    branches:
+      - "package/git-ready-temp"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target feature branch with full history
+        uses: actions/checkout@v4
+        with:
+          ref: feat/social-video-audio-resolvers
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare clean Git metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote set-url origin https://github.com/Kate-alt-69/ytdlnis.git
+          git fetch origin feat/social-video-audio-resolvers
+          git switch -C feat/social-video-audio-resolvers --track origin/feat/social-video-audio-resolvers
+          test "$(git rev-parse HEAD)" = "92f7458002afbb8172a37d3137350ad16e656692"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git config --local --unset-all http.https://github.com/Kate-alt-69/ytdlnis.extraheader || true
+          git status --short --branch
+          git remote -v
+
+      - name: Create ZIP including .git
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/YTDLnis-1.8.9.5.beta-git-ready.zip"
+          cd "$(dirname "$GITHUB_WORKSPACE")"
+          zip -qr "$archive" "$(basename "$GITHUB_WORKSPACE")"
+          unzip -l "$archive" | grep -F '/.git/HEAD'
+          sha256sum "$archive"
+
+      - name: Upload Git-ready ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTDLnis-1.8.9.5.beta-git-ready
+          path: ${{ runner.temp }}/YTDLnis-1.8.9.5.beta-git-ready.zip
+          compression-level: 0
+          retention-days: 1
