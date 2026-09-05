@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - "**"
+      - "!package/git-ready-temp"
 
 jobs:
   build:
@@ -49,11 +50,9 @@ jobs:
           echo "${{ secrets.LOCAL_PROPERTIES }}" > keystore.properties
           chmod +x gradlew
 
-      # Build ONLY the specific flavor assigned to this matrix runner
       - name: Build ${{ matrix.flavor }} APK release
         run: ./gradlew ${{ matrix.task }} --warning-mode all
 
-      # Upload individual ABI artifacts for this runner's flavor
       - name: Upload arm64
         uses: actions/upload-artifact@v4
         with:
@@ -90,7 +89,6 @@ jobs:
           name: YTDLnis APK release ${{ matrix.display_name }} generated
           path: ${{ env.main_project_module }}/build/outputs/apk/${{ matrix.flavor }}/release/
 
-  # Separate job for Telegram so you only get ONE notification when all builds finish
   notify:
     needs: build
     runs-on: ubuntu-latest
