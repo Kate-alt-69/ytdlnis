@@ -21,6 +21,7 @@ from yt_dlp.utils.traversal import traverse_obj
 
 
 _WEB_BASE_URL = 'https://www.instagram.com/'
+_PLUGIN_REVISION = '2026.09.05.1'
 _AUDIO_URL_KEYS = (
     'progressive_download_url',
     'fast_start_progressive_download_url',
@@ -30,6 +31,8 @@ _AUDIO_URL_KEYS = (
 _AUDIO_ID_KEYS = (
     'audio_asset_id',
     'audio_cluster_id',
+    'original_sound_audio_asset_id',
+    'original_audio_id',
     'music_canonical_id',
     'id',
 )
@@ -60,19 +63,65 @@ class InstagramAudioIE(InstagramBaseIE):
                 yield from InstagramAudioIE._walk_dicts(child)
 
     @classmethod
+    def _candidate_ids(cls, item):
+        return {
+            str(item.get(key))
+            for key in _AUDIO_ID_KEYS
+            if item.get(key) is not None
+        }
+
+    @classmethod
+    def _is_audio_candidate(cls, item):
+        return isinstance(item, dict) and any(
+            item.get(key) for key in (*_AUDIO_URL_KEYS, 'dash_manifest'))
+
+    @classmethod
     def _find_audio_info(cls, payload, audio_id):
-        """Find the audio object without accidentally selecting a recommended sound."""
-        exact = []
-        fallback = []
-        for item in cls._walk_dicts(payload):
-            if not any(item.get(key) for key in (*_AUDIO_URL_KEYS, 'dash_manifest')):
+        """Select the requested audio object without choosing a related sound."""
+        if not isinstance(payload, (dict, list)):
+            return None
+
+        requested_id = str(audio_id)
+
+        # clips/music/ normally exposes the requested track here. Prefer these
+        # canonical locations before doing a recursive rollout-compatible scan.
+        canonical_candidates = (
+            traverse_obj(payload, ('metadata', 'music_info', 'music_asset_info', {dict})),
+            traverse_obj(payload, ('metadata', 'original_sound_info', {dict})),
+            traverse_obj(payload, ('music_info', 'music_asset_info', {dict})),
+            traverse_obj(payload, ('original_sound_info', {dict})),
+        )
+        for candidate in canonical_candidates:
+            if not cls._is_audio_candidate(candidate):
                 continue
-            fallback.append(item)
-            if any(
-                    str(item.get(key)) == str(audio_id)
-                    for key in _AUDIO_ID_KEYS if item.get(key) is not None):
+            candidate_ids = cls._candidate_ids(candidate)
+            if not candidate_ids or requested_id in candidate_ids:
+                return candidate
+
+        exact = []
+        anonymous = []
+        mismatched = []
+        for item in cls._walk_dicts(payload):
+            if not cls._is_audio_candidate(item):
+                continue
+            candidate_ids = cls._candidate_ids(item)
+            if requested_id in candidate_ids:
                 exact.append(item)
-        return (exact or fallback or [None])[0]
+            elif candidate_ids:
+                mismatched.append(item)
+            else:
+                anonymous.append(item)
+
+        if exact:
+            return exact[0]
+
+        # Only accept an ID-less fallback when it is unambiguous and there are
+        # no identified candidates for some *other* sound. Audio aggregation
+        # responses commonly include recommended tracks, and downloading one of
+        # those would be worse than a clean expected failure.
+        if len(anonymous) == 1 and not mismatched:
+            return anonymous[0]
+        return None
 
     def _instagram_cookies(self):
         # Cookies supplied through YTDLnis/yt-dlp's normal --cookies option are
@@ -97,8 +146,7 @@ class InstagramAudioIE(InstagramBaseIE):
     def _download_audio_metadata(self, webpage_url, audio_id):
         headers = self._api_headers_for_audio(webpage_url)
 
-        # This mirrors Instagram's track-info request. It is also the request
-        # shape used by maintained Instagram private-API clients.
+        # This mirrors Instagram's track-info request.
         payload = self._download_json(
             f'{self._API_BASE_URL}/clips/music/', audio_id,
             note='Downloading Instagram audio metadata',
@@ -143,10 +191,32 @@ class InstagramAudioIE(InstagramBaseIE):
             value = value.replace('\\u0026', '&').replace('\\/', '/')
         return url_or_none(html.unescape(value))
 
+    def _extract_audio_fields_from_window(self, window):
+        result = {}
+        for key in _AUDIO_URL_KEYS:
+            raw_url = self._search_regex(
+                rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+                window, key, default=None)
+            media_url = self._decode_embedded_url(raw_url)
+            if media_url:
+                result[key] = media_url
+
+        dash_manifest = self._search_regex(
+            r'"dash_manifest"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            window, 'DASH manifest', default=None)
+        if dash_manifest:
+            try:
+                result['dash_manifest'] = json.loads(f'"{dash_manifest}"')
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result['dash_manifest'] = (
+                    dash_manifest.replace('\\n', '\n')
+                    .replace('\\"', '"')
+                    .replace('\\/', '/'))
+        return result
+
     def _audio_from_webpage(self, webpage_url, audio_id):
         # Do not pass newer yt-dlp-only `impersonate=` helpers here. YTDLnis
-        # currently bundles yt-dlp 2025.11.12 and its normal downloader headers +
-        # cookie jar are sufficient for the authenticated webpage path.
+        # currently bundles yt-dlp 2025.11.12.
         webpage = self._download_webpage(
             webpage_url, audio_id,
             note='Checking Instagram audio webpage',
@@ -155,39 +225,36 @@ class InstagramAudioIE(InstagramBaseIE):
         if not webpage:
             return None
 
-        # Prefer JSON close to the requested asset id. Reels audio pages can carry
-        # recommendation data for other sounds too, so a page-wide first match can
-        # silently select the wrong audio.
-        windows = []
+        # Search only windows around the requested ID first. Reels audio pages can
+        # carry recommendation data for other sounds, so a page-wide first match
+        # can silently select the wrong audio.
         for match in re.finditer(re.escape(str(audio_id)), webpage):
-            windows.append(webpage[max(0, match.start() - 12_000):match.end() + 24_000])
-        windows.append(webpage)
-
-        for window in windows:
-            result = {'id': audio_id}
-            for key in _AUDIO_URL_KEYS:
-                raw_url = self._search_regex(
-                    rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-                    window, key, default=None)
-                media_url = self._decode_embedded_url(raw_url)
-                if media_url:
-                    result[key] = media_url
-
-            dash_manifest = self._search_regex(
-                r'"dash_manifest"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
-                window, 'DASH manifest', default=None)
-            if dash_manifest:
-                try:
-                    result['dash_manifest'] = json.loads(f'"{dash_manifest}"')
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    result['dash_manifest'] = (
-                        dash_manifest.replace('\\n', '\n')
-                        .replace('\\"', '"')
-                        .replace('\\/', '/'))
-
-            if any(result.get(key) for key in (*_AUDIO_URL_KEYS, 'dash_manifest')):
+            window = webpage[max(0, match.start() - 12_000):match.end() + 24_000]
+            result = self._extract_audio_fields_from_window(window)
+            if result:
+                result['id'] = audio_id
                 result['title'] = self._og_search_title(webpage, default=None)
                 return result
+
+        # Some public page variants omit the numeric ID next to the media object.
+        # In that case accept a page-wide result only when there is exactly one
+        # unique audio URL. This avoids returning a recommended sound.
+        unique_urls = {}
+        for key in _AUDIO_URL_KEYS:
+            for raw_url in re.findall(
+                    rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+                    webpage):
+                media_url = self._decode_embedded_url(raw_url)
+                if media_url:
+                    unique_urls.setdefault(media_url, key)
+
+        if len(unique_urls) == 1:
+            media_url, key = next(iter(unique_urls.items()))
+            return {
+                'id': audio_id,
+                'title': self._og_search_title(webpage, default=None),
+                key: media_url,
+            }
         return None
 
     def _extract_formats(self, audio_info, audio_id):
@@ -232,10 +299,12 @@ class InstagramAudioIE(InstagramBaseIE):
             mpd_doc = self._parse_xml(dash_manifest, audio_id, fatal=False)
             if mpd_doc is not None:
                 for fmt in self._parse_mpd_formats(mpd_doc, mpd_id='dash'):
-                    # This extractor is deliberately audio-only. Instagram audio
-                    # manifests should already contain audio Representations, but
-                    # keep yt-dlp's format selection from treating them as video.
-                    fmt.setdefault('vcodec', 'none')
+                    # Keep only audio representations. Do not relabel a video
+                    # representation as audio simply because this extractor is
+                    # audio-only.
+                    if fmt.get('vcodec') not in (None, 'none'):
+                        continue
+                    fmt['vcodec'] = 'none'
                     formats.append(fmt)
 
         return formats
@@ -243,6 +312,7 @@ class InstagramAudioIE(InstagramBaseIE):
     def _real_extract(self, url):
         audio_id = self._match_id(url)
         clean_url = f'{_WEB_BASE_URL}reels/audio/{audio_id}/'
+        self.write_debug(f'YTDLnis Instagram audio plugin revision {_PLUGIN_REVISION}')
 
         audio_info = self._download_audio_metadata(clean_url, audio_id)
         if not audio_info:
@@ -280,12 +350,16 @@ class InstagramAudioIE(InstagramBaseIE):
         if not thumbnail:
             thumbnail = traverse_obj(audio_info, ('ig_artist', 'profile_pic_url', {url_or_none}))
 
+        duration_ms = (
+            audio_info.get('duration_in_ms')
+            or audio_info.get('audio_duration_in_ms')
+        )
         return {
             'id': audio_id,
             'title': title,
             'artist': artist,
             'uploader': artist,
-            'duration': float_or_none(audio_info.get('duration_in_ms'), scale=1000),
+            'duration': float_or_none(duration_ms, scale=1000),
             'thumbnail': thumbnail,
             'formats': formats,
             'webpage_url': clean_url,

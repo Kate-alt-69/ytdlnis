@@ -15,6 +15,7 @@ import java.io.IOException
  */
 object SocialExtractorPluginInstaller {
     private const val PLUGIN_ROOT = "yt-dlp-plugins/ytdlnis-social/yt_dlp_plugins/extractor"
+    private const val BUNDLE_REVISION = "2026.09.05.1"
 
     private val bundledPlugins = listOf(
         "social_extractors/instagram_audio.py" to "instagram_audio.py",
@@ -34,18 +35,36 @@ object SocialExtractorPluginInstaller {
             }
         }
 
+        var changed = false
         bundledPlugins.forEach { (assetPath, outputName) ->
-            installAsset(context, assetPath, File(extractorDir, outputName))
+            changed = installAsset(context, assetPath, File(extractorDir, outputName)) || changed
+        }
+
+        // Python bytecode lives outside the APK too. It should normally invalidate
+        // itself when the source changes, but deleting it after a bundled plugin
+        // refresh guarantees an upgraded APK cannot execute a stale extractor.
+        if (changed) {
+            File(extractorDir, "__pycache__").deleteRecursively()
+        }
+
+        // Keep a tiny on-device marker so logs/bug reports can identify which
+        // bundled plugin set an installed APK was supposed to deploy.
+        val revisionFile = File(extractorDir.parentFile, ".ytdlnis-social-revision")
+        if (!revisionFile.exists() || revisionFile.readText() != BUNDLE_REVISION) {
+            revisionFile.writeText(BUNDLE_REVISION)
         }
     }
 
-    private fun installAsset(context: Context, assetPath: String, destination: File) {
+    private fun installAsset(context: Context, assetPath: String, destination: File): Boolean {
         val bundledBytes = context.assets.open(assetPath).use { it.readBytes() }
         if (destination.exists() && destination.readBytes().contentEquals(bundledBytes)) {
-            return
+            return false
         }
 
         val temp = File(destination.parentFile, ".${destination.name}.tmp")
+        if (temp.exists() && !temp.delete()) {
+            throw IOException("Could not clear stale plugin temp file: ${temp.absolutePath}")
+        }
         temp.writeBytes(bundledBytes)
 
         // Android's File.renameTo does not replace an existing destination reliably.
@@ -57,8 +76,12 @@ object SocialExtractorPluginInstaller {
 
         if (!temp.renameTo(destination)) {
             // Cross-filesystem rename should not happen here, but keep a safe fallback.
-            destination.writeBytes(bundledBytes)
-            temp.delete()
+            try {
+                destination.writeBytes(bundledBytes)
+            } finally {
+                temp.delete()
+            }
         }
+        return true
     }
 }
