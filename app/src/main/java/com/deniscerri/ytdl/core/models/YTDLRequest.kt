@@ -72,6 +72,9 @@ class YTDLRequest {
         commandList.addAll(options.buildOptions())
         commandList.addAll(customCommandList)
         commandList.addAll(urls)
-        return commandList
+
+        // Validate the final flattened command so compatibility rules also cover
+        // arguments supplied by command templates/custom command fragments.
+        return YTDLCommandCompatibility.sanitize(commandList)
     }
 }
