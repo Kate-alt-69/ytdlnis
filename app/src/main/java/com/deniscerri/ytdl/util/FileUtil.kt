@@ -326,16 +326,41 @@ object FileUtil {
         }
     }
 
+    private fun ensureCacheSubdirectory(context: Context, name: String): File {
+        val preferred = File(getCachePath(context), name)
+        if (preferred.isDirectory || preferred.mkdirs() || preferred.isDirectory) {
+            return preferred
+        }
+
+        // External/custom cache storage can disappear while Android still keeps
+        // its old path. Request construction must not crash just because that
+        // cache root is temporarily unavailable; use the app-internal cache as a
+        // safe fallback for this run instead.
+        val fallback = File(File(context.cacheDir, "ytdlnis_cache"), name)
+        if (fallback.isDirectory || fallback.mkdirs() || fallback.isDirectory) {
+            Log.w(
+                "FileUtil",
+                "Cache directory unavailable (${preferred.absolutePath}); using ${fallback.absolutePath}",
+            )
+            return fallback
+        }
+
+        // Return the fallback path even in the extreme case that mkdirs failed.
+        // Callers will then report the actual I/O failure instead of continuing
+        // to use a known-bad external/custom path.
+        return fallback
+    }
+
     fun getCacheDownloadsPath(context: Context): String {
-        return "${getCachePath(context)}dl"
+        return ensureCacheSubdirectory(context, "dl").absolutePath
     }
 
     fun getCacheYTDLPPath(context: Context) : String {
-        return "${getCachePath(context)}yt-dlp"
+        return ensureCacheSubdirectory(context, "yt-dlp").absolutePath
     }
 
     fun getInfoJsonPath(context: Context) : String {
-        return "${getCachePath(context)}infojsons"
+        return ensureCacheSubdirectory(context, "infojsons").absolutePath
     }
 
     fun deleteConfigFiles(request: YTDLRequest) {
